@@ -13,9 +13,18 @@
 (define-constant ERR_NO_DELEGATION (err u111))
 (define-constant ERR_ALREADY_DELEGATE (err u112))
 (define-constant ERR_DELEGATE_NOT_FOUND (err u113))
+(define-constant ERR_NO_REWARDS (err u114))
+(define-constant ERR_REWARD_ALREADY_CLAIMED (err u115))
+(define-constant ERR_INVALID_REWARD_PERIOD (err u116))
+(define-constant ERR_REWARD_POOL_EMPTY (err u117))
+(define-constant ERR_UNAUTHORIZED_ADMIN (err u118))
 
 (define-data-var next-proposal-id uint u1)
 (define-data-var governance-token principal .governance-token)
+(define-data-var reward-admin principal tx-sender)
+(define-data-var current-reward-period uint u1)
+(define-data-var reward-per-period uint u1000000)
+(define-data-var total-reward-pool uint u0)
 
 (define-map user-locks
   { user: principal }
@@ -71,6 +80,42 @@
   { start-height: uint, end-height: (optional uint), total-proposals-voted: uint }
 )
 
+(define-map user-rewards
+  { user: principal, period: uint }
+  {
+    base-reward: uint,
+    participation-bonus: uint,
+    delegation-bonus: uint,
+    total-reward: uint,
+    claimed: bool,
+    claim-height: (optional uint)
+  }
+)
+
+(define-map period-stats
+  { period: uint }
+  {
+    total-locked: uint,
+    total-voting-power: uint,
+    total-participants: uint,
+    total-votes-cast: uint,
+    reward-pool: uint,
+    start-height: uint,
+    end-height: uint
+  }
+)
+
+(define-map user-participation
+  { user: principal, period: uint }
+  {
+    votes-cast: uint,
+    proposals-created: uint,
+    delegation-changes: uint,
+    lock-extensions: uint,
+    participation-score: uint
+  }
+)
+
 (define-public (lock-tokens (amount uint) (duration uint))
   (let (
     (current-height stacks-block-height)
@@ -120,6 +165,7 @@
         voting-power: new-voting-power
       })
     )
+    (update-user-participation tx-sender u0 u0 u0 u1)
     (ok new-voting-power)
   )
 )
@@ -146,6 +192,7 @@
       }
     )
     (var-set next-proposal-id (+ proposal-id u1))
+    (update-user-participation tx-sender u0 u1 u0 u0)
     (ok proposal-id)
   )
 )
@@ -187,6 +234,7 @@
         })
       )
     )
+    (update-user-participation tx-sender u1 u0 u0 u0)
     (ok voting-power)
   )
 )
@@ -239,6 +287,7 @@
       { delegator: delegator, delegate: delegate }
       { start-height: current-height, end-height: none, total-proposals-voted: u0 }
     )
+    (update-user-participation delegator u0 u0 u1 u0)
     (ok delegate)
   )
 )
@@ -381,7 +430,185 @@
   )
 )
 
+(define-public (fund-reward-pool (amount uint))
+  (let (
+    (current-pool (var-get total-reward-pool))
+  )
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (var-set total-reward-pool (+ current-pool amount))
+    (ok amount)
+  )
+)
 
+(define-public (calculate-period-rewards (period uint))
+  (let (
+    (period-data (unwrap! (map-get? period-stats { period: period }) ERR_INVALID_REWARD_PERIOD))
+    (reward-pool (get reward-pool period-data))
+    (total-locked (get total-locked period-data))
+    (total-participants (get total-participants period-data))
+  )
+    (asserts! (is-eq tx-sender (var-get reward-admin)) ERR_UNAUTHORIZED_ADMIN)
+    (asserts! (> total-participants u0) ERR_NO_REWARDS)
+    (ok true)
+  )
+)
+
+(define-public (claim-rewards (period uint))
+  (let (
+    (user tx-sender)
+    (reward-data (unwrap! (map-get? user-rewards { user: user, period: period }) ERR_NO_REWARDS))
+    (total-reward (get total-reward reward-data))
+    (current-height stacks-block-height)
+  )
+    (asserts! (not (get claimed reward-data)) ERR_REWARD_ALREADY_CLAIMED)
+    (asserts! (> total-reward u0) ERR_NO_REWARDS)
+    (asserts! (<= total-reward (var-get total-reward-pool)) ERR_REWARD_POOL_EMPTY)
+    (try! (as-contract (stx-transfer? total-reward tx-sender user)))
+    (var-set total-reward-pool (- (var-get total-reward-pool) total-reward))
+    (map-set user-rewards
+      { user: user, period: period }
+      (merge reward-data {
+        claimed: true,
+        claim-height: (some current-height)
+      })
+    )
+    (ok total-reward)
+  )
+)
+
+(define-public (start-new-reward-period)
+  (let (
+    (current-period (var-get current-reward-period))
+    (new-period (+ current-period u1))
+    (current-height stacks-block-height)
+    (reward-amount (var-get reward-per-period))
+  )
+    (asserts! (is-eq tx-sender (var-get reward-admin)) ERR_UNAUTHORIZED_ADMIN)
+    (map-set period-stats
+      { period: new-period }
+      {
+        total-locked: u0,
+        total-voting-power: u0,
+        total-participants: u0,
+        total-votes-cast: u0,
+        reward-pool: reward-amount,
+        start-height: current-height,
+        end-height: (+ current-height u1008)
+      }
+    )
+    (var-set current-reward-period new-period)
+    (ok new-period)
+  )
+)
+
+(define-public (distribute-user-reward (user principal) (period uint))
+  (let (
+    (user-lock (map-get? user-locks { user: user }))
+    (participation (default-to 
+      { votes-cast: u0, proposals-created: u0, delegation-changes: u0, lock-extensions: u0, participation-score: u0 }
+      (map-get? user-participation { user: user, period: period })))
+    (base-reward (calculate-base-reward user period))
+    (participation-bonus (calculate-participation-bonus user period))
+    (delegation-bonus (calculate-delegation-bonus user period))
+    (total-reward (+ (+ base-reward participation-bonus) delegation-bonus))
+  )
+    (asserts! (is-eq tx-sender (var-get reward-admin)) ERR_UNAUTHORIZED_ADMIN)
+    (asserts! (is-some user-lock) ERR_LOCK_NOT_FOUND)
+    (map-set user-rewards
+      { user: user, period: period }
+      {
+        base-reward: base-reward,
+        participation-bonus: participation-bonus,
+        delegation-bonus: delegation-bonus,
+        total-reward: total-reward,
+        claimed: false,
+        claim-height: none
+      }
+    )
+    (ok total-reward)
+  )
+)
+
+(define-public (set-reward-admin (new-admin principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get reward-admin)) ERR_UNAUTHORIZED_ADMIN)
+    (var-set reward-admin new-admin)
+    (ok new-admin)
+  )
+)
+
+(define-public (update-reward-per-period (new-amount uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get reward-admin)) ERR_UNAUTHORIZED_ADMIN)
+    (asserts! (> new-amount u0) ERR_INVALID_AMOUNT)
+    (var-set reward-per-period new-amount)
+    (ok new-amount)
+  )
+)
+
+(define-private (update-user-participation (user principal) (votes uint) (proposal-count uint) (delegation-count uint) (extensions uint))
+  (let (
+    (current-period (var-get current-reward-period))
+    (current-participation (default-to
+      { votes-cast: u0, proposals-created: u0, delegation-changes: u0, lock-extensions: u0, participation-score: u0 }
+      (map-get? user-participation { user: user, period: current-period })))
+    (new-votes (+ (get votes-cast current-participation) votes))
+    (new-proposals (+ (get proposals-created current-participation) proposal-count))
+    (new-delegations (+ (get delegation-changes current-participation) delegation-count))
+    (new-extensions (+ (get lock-extensions current-participation) extensions))
+    (new-score (+ (+ new-votes (* new-proposals u2)) (+ new-delegations new-extensions)))
+  )
+    (map-set user-participation
+      { user: user, period: current-period }
+      {
+        votes-cast: new-votes,
+        proposals-created: new-proposals,
+        delegation-changes: new-delegations,
+        lock-extensions: new-extensions,
+        participation-score: new-score
+      }
+    )
+    true
+  )
+)
+
+(define-private (calculate-base-reward (user principal) (period uint))
+  (let (
+    (user-lock (unwrap-panic (map-get? user-locks { user: user })))
+    (period-data (unwrap-panic (map-get? period-stats { period: period })))
+    (user-amount (get amount user-lock))
+    (total-locked (get total-locked period-data))
+    (reward-pool (get reward-pool period-data))
+  )
+    (if (> total-locked u0)
+      (/ (* reward-pool user-amount) total-locked)
+      u0
+    )
+  )
+)
+
+(define-private (calculate-participation-bonus (user principal) (period uint))
+  (let (
+    (participation (default-to
+      { votes-cast: u0, proposals-created: u0, delegation-changes: u0, lock-extensions: u0, participation-score: u0 }
+      (map-get? user-participation { user: user, period: period })))
+    (score (get participation-score participation))
+  )
+    (* score u10000)
+  )
+)
+
+(define-private (calculate-delegation-bonus (user principal) (period uint))
+  (let (
+    (delegate-info (map-get? delegate-power { delegate: user }))
+  )
+    (match delegate-info
+      info (/ (get total-delegated-power info) u100)
+      u0
+    )
+  )
+)
 
 (define-read-only (get-user-lock (user principal))
   (map-get? user-locks { user: user })
@@ -526,14 +753,34 @@
     )
   )
 )
-;;
 
-;; public functions
-;;
+(define-read-only (get-user-rewards (user principal) (period uint))
+  (map-get? user-rewards { user: user, period: period })
+)
 
-;; read only functions
-;;
+(define-read-only (get-period-stats (period uint))
+  (map-get? period-stats { period: period })
+)
 
-;; private functions
-;;
+(define-read-only (get-user-participation (user principal) (period uint))
+  (map-get? user-participation { user: user, period: period })
+)
+
+(define-read-only (get-reward-admin)
+  (var-get reward-admin)
+)
+
+(define-read-only (get-current-reward-period)
+  (var-get current-reward-period)
+)
+
+(define-read-only (get-reward-per-period)
+  (var-get reward-per-period)
+)
+
+(define-read-only (get-total-reward-pool)
+  (var-get total-reward-pool)
+)
+
+
 
