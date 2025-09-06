@@ -1,0 +1,23 @@
+[project]
+name = 'VoteLock'
+description = ''
+authors = []
+telemetry = true
+cache_dir = '.\.cache'
+requirements = []
+[contracts.VoteLock]
+path = 'contracts/VoteLock.clar'
+clarity_version = 3
+epoch = 3.1
+[contracts.proposal-executor]
+path = 'contracts/proposal-executor.clar'
+clarity_version = 3
+epoch = 3.1
+[repl.analysis]
+passes = ['check_checker']
+
+[repl.analysis.check_checker]
+strict = false
+trusted_sender = false
+trusted_caller = false
+callee_filter = false
